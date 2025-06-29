@@ -36,20 +36,69 @@
     const ENEMY_PATTERNS = ['straight', 'zigzag', 'sine'];
     const enemySpawnInterval = 60; // frames
     const itemSpawnInterval = 600; // frames
+    const ITEM_TYPES = ['3way', 'shield', 'bomb', 'bomb', 'laser']; // レーザーを追加
 
     // --- ゲーム変数 ---
     const canvas = document.getElementById('gameCanvas');
     const ctx = canvas.getContext('2d');
+    let audioManager;
     let gameState = GAME_STATE.START;
     const keys = {};
     let spacePressed = false;
     let player, bullets, enemyBullets, enemies, items, stars;
-    let enemySpawnTimer, itemSpawnTimer, score, lives, powerup3way, powerup3wayTimer;
+    let enemySpawnTimer, itemSpawnTimer, score, lives, bombs, powerup3way, powerup3wayTimer, powerupShield, powerupShieldTimer, powerupLaser, powerupLaserTimer, screenFlashTimer;
+    let highScore = localStorage.getItem('shootingGameHighScore') || 0;
 
     // --- クラス定義 ---
+    class AudioManager {
+      constructor() { this.audioCtx = null; }
+      init() { if (!this.audioCtx) { this.audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } }
+      _playSound(freq, duration, type = 'sine', volume = 0.5, decay = false) {
+        if (!this.audioCtx) return;
+        const oscillator = this.audioCtx.createOscillator();
+        const gainNode = this.audioCtx.createGain();
+        oscillator.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+        gainNode.gain.setValueAtTime(volume, this.audioCtx.currentTime);
+        if(decay) {
+            gainNode.gain.exponentialRampToValueAtTime(0.0001, this.audioCtx.currentTime + duration / 1000);
+        }
+        oscillator.frequency.setValueAtTime(freq, this.audioCtx.currentTime);
+        oscillator.type = type;
+        oscillator.start();
+        setTimeout(() => { oscillator.stop(); }, duration);
+      }
+      _playNoise(duration, volume = 0.3) {
+        if (!this.audioCtx) return;
+        const bufferSize = this.audioCtx.sampleRate * duration / 1000;
+        const buffer = this.audioCtx.createBuffer(1, bufferSize, this.audioCtx.sampleRate);
+        const output = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) { output[i] = Math.random() * 2 - 1; }
+        const source = this.audioCtx.createBufferSource();
+        source.buffer = buffer;
+        const gainNode = this.audioCtx.createGain();
+        gainNode.gain.setValueAtTime(volume, this.audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.0001, this.audioCtx.currentTime + duration / 1000);
+        source.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+        source.start();
+      }
+      playShoot() { this._playSound(440, 50, 'triangle', 0.1, true); }
+      playExplosion() { this._playNoise(150, 0.2); }
+      playPlayerHit() { this._playSound(160, 200, 'sawtooth', 0.4, true); }
+      playPickup() { this._playSound(523, 50, 'sine', 0.2); setTimeout(() => this._playSound(784, 80, 'sine', 0.2), 60); }
+      playBomb() { this._playNoise(500, 0.6); }
+    }
     class Player {
       constructor() { this.w = 30; this.h = 30; this.x = (CANVAS_WIDTH - this.w) / 2; this.y = CANVAS_HEIGHT - this.h - 20; this.speed = 5; this.shotInterval = 100; this.lastShot = 0; }
-      update() { if (keys['ArrowLeft'] || keys['KeyA']) this.x -= this.speed; if (keys['ArrowRight'] || keys['KeyD']) this.x += this.speed; if (keys['ArrowUp'] || keys['KeyW']) this.y -= this.speed; if (keys['ArrowDown'] || keys['KeyS']) this.y += this.speed; this.x = Math.max(0, Math.min(CANVAS_WIDTH - this.w, this.x)); this.y = Math.max(0, Math.min(CANVAS_HEIGHT - this.h, this.y)); }
+      update() {
+        if (keys['ArrowLeft'] || keys['KeyA']) this.x -= this.speed;
+        if (keys['ArrowRight'] || keys['KeyD']) this.x += this.speed;
+        if (keys['ArrowUp'] || keys['KeyW']) this.y -= this.speed;
+        if (keys['ArrowDown'] || keys['KeyS']) this.y += this.speed;
+        this.x = Math.max(0, Math.min(CANVAS_WIDTH - this.w, this.x));
+        this.y = Math.max(0, Math.min(CANVAS_HEIGHT - this.h, this.y));
+      }
       draw(ctx) { ctx.fillStyle = '#0af'; ctx.beginPath(); ctx.moveTo(this.x + this.w / 2, this.y); ctx.lineTo(this.x, this.y + this.h); ctx.lineTo(this.x + this.w, this.y + this.h); ctx.closePath(); ctx.fill(); }
       canShoot() { return window.performance.now() - this.lastShot > this.shotInterval; }
       shoot(angle = 0) { this.lastShot = window.performance.now(); const speed = 10, vx = Math.sin(angle) * speed, vy = -Math.cos(angle) * speed; return new Bullet(this.x + this.w / 2 - 3, this.y - 10, speed, '#3af', vy, vx); }
@@ -59,6 +108,14 @@
         update() { this.x += this.vx; this.y += this.vy; if (this.y + this.h < 0 || this.y > CANVAS_HEIGHT || this.x + this.w < 0 || this.x > CANVAS_WIDTH) this.active = false; }
         draw(ctx) { ctx.fillStyle = this.color; ctx.fillRect(this.x, this.y, this.w, this.h); }
     }
+    class Laser extends Bullet {
+      constructor(x, y) {
+        super(x, y, 15, '#f0f', -15, 0); // speed, color, vy, vx
+        this.w = 5;
+        this.h = 25;
+      }
+    }
+
     class Enemy {
       constructor(typeIndex, pattern) { const type = ENEMY_TYPES[typeIndex]; this.size = type.size; this.hp = type.hp; this.color = type.color; this.score = type.score; this.x = Math.random() * (CANVAS_WIDTH - this.size); this.y = -this.size; this.pattern = pattern; this.baseX = this.x; this.frame = 0; this.speed = 2 + typeIndex; this.zigzagDir = Math.random() < 0.5 ? -1 : 1; this.sinePhase = Math.random() * Math.PI * 2; this.active = true; }
       update() { this.frame++; if (this.pattern === 'straight') { this.y += this.speed; } else if (this.pattern === 'zigzag') { this.y += this.speed; this.x += Math.sin(this.frame / 15) * 3 * this.zigzagDir; } else if (this.pattern === 'sine') { this.y += this.speed; this.x = this.baseX + Math.sin(this.frame / 15 + this.sinePhase) * 40; } if (this.y > CANVAS_HEIGHT) this.active = false; }
@@ -67,28 +124,61 @@
     class Item {
       constructor(x, y, type) { this.x = x; this.y = y; this.w = 24; this.h = 24; this.type = type; this.active = true; }
       update() { this.y += 2; if (this.y > CANVAS_HEIGHT) this.active = false; }
-      draw(ctx) { if (this.type === '3way') { ctx.fillStyle = '#6ff'; ctx.beginPath(); ctx.arc(this.x + this.w/2, this.y + this.h/2, 12, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('3', this.x + this.w/2, this.y + this.h/2); } }
+      draw(ctx) {
+        ctx.save();
+        if (this.type === '3way') {
+          ctx.fillStyle = '#6ff'; ctx.beginPath(); ctx.arc(this.x + this.w/2, this.y + this.h/2, 12, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('3', this.x + this.w/2, this.y + this.h/2);
+        } else if (this.type === 'shield') {
+          ctx.fillStyle = '#5af'; ctx.beginPath(); ctx.arc(this.x + this.w/2, this.y + this.h/2, 12, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('S', this.x + this.w/2, this.y + this.h/2);
+        } else if (this.type === 'bomb') {
+          ctx.fillStyle = '#f55'; ctx.beginPath(); ctx.arc(this.x + this.w/2, this.y + this.h/2, 12, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('B', this.x + this.w/2, this.y + this.h/2);
+        } else if (this.type === 'laser') {
+          ctx.fillStyle = '#f0f'; ctx.beginPath(); ctx.arc(this.x + this.w/2, this.y + this.h/2, 12, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('L', this.x + this.w/2, this.y + this.h/2);
+        }
+        ctx.restore();
+      }
     }
 
     // --- ヘルパー関数 ---
     function createStars() { stars = []; for (let i = 0; i < 100; i++) stars.push({ x: Math.random() * CANVAS_WIDTH, y: Math.random() * CANVAS_HEIGHT, size: Math.random() * 2 + 1, speed: Math.random() * 0.5 + 0.2 }); }
     function updateAndDrawStars() { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT); ctx.fillStyle = '#fff'; stars.forEach(star => { star.y += star.speed; if (star.y > CANVAS_HEIGHT) { star.y = 0; star.x = Math.random() * CANVAS_WIDTH; } ctx.fillRect(star.x, star.y, star.size, star.size); }); }
-    function drawUI() { ctx.fillStyle = '#fff'; ctx.font = '18px monospace'; ctx.textAlign = 'left'; ctx.fillText(`SCORE: ${score}`, 10, 28); ctx.textAlign = 'right'; ctx.fillText(`LIVES: ${lives}`, CANVAS_WIDTH - 10, 28); if (powerup3way) { ctx.font = '16px monospace'; ctx.textAlign = 'center'; ctx.fillText(`3WAY: ${Math.ceil(powerup3wayTimer/60)}`, CANVAS_WIDTH/2, 28); } }
-    function drawStartScreen() { ctx.fillStyle = '#fff'; ctx.font = '32px monospace'; ctx.textAlign = 'center'; ctx.fillText('縦スクロール', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 40); ctx.fillText('シューティング', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2); ctx.font = '20px monospace'; ctx.fillText('スペースキーで開始', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 60); }
-    function drawGameOverScreen() { ctx.fillStyle = '#fff'; ctx.font = '36px monospace'; ctx.textAlign = 'center'; ctx.fillText('GAME OVER', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2); ctx.font = '20px monospace'; ctx.fillText('Rキーでリスタート', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 60); }
+    function drawUI() {
+      ctx.save();
+      ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
+      ctx.textAlign = 'left'; ctx.fillText(`SCORE: ${score}`, 10, 28);
+      ctx.textAlign = 'right'; ctx.fillText(`LIVES: ${lives}`, CANVAS_WIDTH - 10, 28);
+      ctx.textAlign = 'center'; ctx.fillText(`HI-SCORE: ${highScore}`, CANVAS_WIDTH / 2, 28);
+      ctx.textAlign = 'left'; ctx.fillText(`BOMBS: ${bombs}`, 10, CANVAS_HEIGHT - 10);
+      ctx.font = '16px monospace'; ctx.textAlign = 'center';
+      let timerY = 50;
+      if (powerup3way) { ctx.fillStyle = '#6ff'; ctx.fillText(`3WAY: ${Math.ceil(powerup3wayTimer/60)}`, CANVAS_WIDTH/2, timerY); timerY += 22; }
+      if (powerupShield) { ctx.fillStyle = '#5af'; ctx.fillText(`SHIELD: ${Math.ceil(powerupShieldTimer/60)}`, CANVAS_WIDTH/2, timerY); timerY += 22; }
+      if (powerupLaser) { ctx.fillStyle = '#f0f'; ctx.fillText(`LASER: ${Math.ceil(powerupLaserTimer/60)}`, CANVAS_WIDTH/2, timerY); }
+      ctx.restore();
+    }
+    function drawStartScreen() { ctx.fillStyle = '#fff'; ctx.font = '32px monospace'; ctx.textAlign = 'center'; ctx.fillText('縦スクロール', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 80); ctx.fillText('シューティング', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 40); ctx.font = '20px monospace'; ctx.fillText('スペースキーで開始', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 20); ctx.font = '24px monospace'; ctx.fillText(`HI-SCORE: ${highScore}`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 80); }
+    function drawGameOverScreen() { ctx.fillStyle = '#fff'; ctx.font = '36px monospace'; ctx.textAlign = 'center'; ctx.fillText('GAME OVER', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 40); ctx.font = '20px monospace'; ctx.fillText(`SCORE: ${score}`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 10); ctx.fillText(`HI-SCORE: ${highScore}`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 40); ctx.fillText('Rキーでリスタート', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 90); }
     function rectsIntersect(a, b) { const a_w = a.w || a.size, a_h = a.h || a.size, b_w = b.w || b.size, b_h = b.h || b.size; return a.x < b.x + b_w && a.x + a_w > b.x && a.y < b.y + b_h && a.y + a_h > b.y; }
+    function setGameOver() { gameState = GAME_STATE.GAMEOVER; if (score > highScore) { highScore = score; localStorage.setItem('shootingGameHighScore', highScore); } }
 
     function resetGame() {
       gameState = GAME_STATE.PLAYING;
       player = new Player();
       bullets = []; enemyBullets = []; enemies = []; items = [];
       enemySpawnTimer = 0; itemSpawnTimer = 0;
-      score = 0; lives = 3;
+      score = 0; lives = 3; bombs = 3;
       powerup3way = false; powerup3wayTimer = 0;
+      powerupShield = false; powerupShieldTimer = 0;
+      powerupLaser = false; powerupLaserTimer = 0;
+      screenFlashTimer = 0;
     }
 
     // --- 入力ハンドラ ---
-    document.addEventListener('keydown', e => { keys[e.code] = true; if (e.code === 'Space') { spacePressed = true; if (gameState === GAME_STATE.START) resetGame(); } if (gameState === GAME_STATE.GAMEOVER && e.code === 'KeyR') resetGame(); });
+    document.addEventListener('keydown', e => { audioManager.init(); keys[e.code] = true; if (e.code === 'Space') { spacePressed = true; if (gameState === GAME_STATE.START) resetGame(); } if (gameState === GAME_STATE.GAMEOVER && e.code === 'KeyR') resetGame(); });
     document.addEventListener('keyup', e => { keys[e.code] = false; if (e.code === 'Space') spacePressed = false; });
 
     // --- メインループ ---
@@ -96,19 +186,45 @@
       // 状態更新
       if (gameState === GAME_STATE.PLAYING) {
         player.update();
-        if (spacePressed && player.canShoot()) { if (powerup3way) { bullets.push(player.shoot(0), player.shoot(-0.3), player.shoot(0.3)); } else { bullets.push(player.shoot(0)); } }
+        if (keys['KeyX'] && bombs > 0) { bombs--; audioManager.playBomb(); enemyBullets = []; enemies.forEach(enemy => { if (enemy.active) { score += enemy.score; enemy.active = false; } }); screenFlashTimer = 10; keys['KeyX'] = false; }
+        if (spacePressed && player.canShoot()) {
+          audioManager.playShoot();
+          if (powerupLaser) {
+            bullets.push(new Laser(player.x + player.w / 2 - 2, player.y - 10));
+          } else if (powerup3way) {
+            bullets.push(player.shoot(0), player.shoot(-0.3), player.shoot(0.3));
+          } else {
+            bullets.push(player.shoot(0));
+          }
+        }
         bullets.forEach(b => b.update());
-        itemSpawnTimer++; if (itemSpawnTimer >= itemSpawnInterval) { itemSpawnTimer = 0; items.push(new Item(Math.random() * (CANVAS_WIDTH - 24), -24, '3way')); }
+        itemSpawnTimer++; if (itemSpawnTimer >= itemSpawnInterval) { itemSpawnTimer = 0; const type = ITEM_TYPES[Math.floor(Math.random() * ITEM_TYPES.length)]; items.push(new Item(Math.random() * (CANVAS_WIDTH - 24), -24, type)); }
         items.forEach(item => item.update());
         enemySpawnTimer++; if (enemySpawnTimer >= enemySpawnInterval) { enemySpawnTimer = 0; const typeIndex = Math.floor(Math.random() * ENEMY_TYPES.length); const pattern = ENEMY_PATTERNS[Math.floor(Math.random() * ENEMY_PATTERNS.length)]; enemies.push(new Enemy(typeIndex, pattern)); }
         enemies.forEach(enemy => { enemy.update(); if (Math.random() < 0.01 && enemy.y > 0) { const dx = (player.x + player.w/2) - (enemy.x + enemy.size/2), dy = (player.y + player.h/2) - (enemy.y + enemy.size/2); const len = Math.sqrt(dx*dx + dy*dy) || 1; const vx = (dx/len) * 5, vy = (dy/len) * 5; enemyBullets.push(new Bullet(enemy.x + enemy.size/2 - 3, enemy.y + enemy.size, 5, '#f33', vy, vx)); } });
         enemyBullets.forEach(b => b.update());
         // 衝突判定
-        bullets.forEach(bullet => { enemies.forEach(enemy => { if (bullet.active && enemy.active && rectsIntersect(bullet, enemy)) { bullet.active = false; enemy.hp--; if (enemy.hp <= 0) { enemy.active = false; score += enemy.score; } } }); });
-        enemyBullets.forEach(bullet => { if (bullet.active && rectsIntersect(bullet, player)) { bullet.active = false; lives--; if (lives <= 0) gameState = GAME_STATE.GAMEOVER; } });
-        enemies.forEach(enemy => { if (enemy.active && rectsIntersect(enemy, player)) { enemy.active = false; lives--; if (lives <= 0) gameState = GAME_STATE.GAMEOVER; } });
-        items.forEach(item => { if (item.active && rectsIntersect(item, player)) { item.active = false; if (item.type === '3way') { powerup3way = true; powerup3wayTimer = 60 * 8; } } });
+        bullets.forEach(bullet => {
+          enemies.forEach(enemy => {
+            if (bullet.active && enemy.active && rectsIntersect(bullet, enemy)) {
+              if (!(bullet instanceof Laser)) {
+                bullet.active = false;
+              }
+              enemy.hp--;
+              if (enemy.hp <= 0) {
+                enemy.active = false;
+                score += enemy.score;
+                audioManager.playExplosion();
+              }
+            }
+          });
+        });
+        enemyBullets.forEach(bullet => { if (bullet.active && rectsIntersect(bullet, player)) { bullet.active = false; if (!powerupShield) { lives--; audioManager.playPlayerHit(); if (lives <= 0) setGameOver(); } } });
+        enemies.forEach(enemy => { if (enemy.active && rectsIntersect(enemy, player)) { enemy.active = false; if (!powerupShield) { lives--; audioManager.playPlayerHit(); if (lives <= 0) setGameOver(); } } });
+        items.forEach(item => { if (item.active && rectsIntersect(item, player)) { item.active = false; audioManager.playPickup(); if (item.type === '3way') { powerup3way = true; powerup3wayTimer = 60 * 8; } else if (item.type === 'shield') { powerupShield = true; powerupShieldTimer = 60 * 5; } else if (item.type === 'bomb') { bombs++; } else if (item.type === 'laser') { powerupLaser = true; powerupLaserTimer = 60 * 7; } } });
         if (powerup3way) { powerup3wayTimer--; if (powerup3wayTimer <= 0) powerup3way = false; }
+        if (powerupShield) { powerupShieldTimer--; if (powerupShieldTimer <= 0) powerupShield = false; }
+        if (powerupLaser) { powerupLaserTimer--; if (powerupLaserTimer <= 0) powerupLaser = false; }
         // 非アクティブ要素の削除
         bullets = bullets.filter(b => b.active); enemyBullets = enemyBullets.filter(b => b.active); enemies = enemies.filter(e => e.active); items = items.filter(i => i.active);
       }
@@ -123,6 +239,8 @@
         items.forEach(i => i.draw(ctx));
         enemies.forEach(e => e.draw(ctx));
         player.draw(ctx);
+        if (powerupShield) { ctx.save(); ctx.strokeStyle = '#5af'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(player.x + player.w / 2, player.y + player.h / 2, player.w * 0.8, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
+        if (screenFlashTimer > 0) { ctx.save(); ctx.fillStyle = `rgba(255, 255, 255, ${screenFlashTimer / 10})`; ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT); ctx.restore(); screenFlashTimer--; }
         drawUI();
       } else if (gameState === GAME_STATE.GAMEOVER) {
         drawGameOverScreen();
@@ -131,104 +249,11 @@
       requestAnimationFrame(gameLoop);
     }
 
-    // --- ゲーム開始 ---
+    // --- 初期化とゲーム開始 ---
+    audioManager = new AudioManager();
     createStars();
+    resetGame();
     gameLoop();
   </script>
-</body>
-</html>            ctx.fillStyle = '#6ff';
-            ctx.fillText('3WAY!', CANVAS_WIDTH / 2, 28);
-          }
-          ctx.restore();
-          break;
-        case GAME_STATE.GAMEOVER:
-          updateAndDrawStars();
-          drawGameOverScreen();
-          break;
-      }
-      // 次フレームへ
-      requestAnimationFrame(gameLoop);
-    }
-    // ゲーム開始
-    gameLoop();
-  }
-// 矩形の衝突判定関数
-function rectsIntersect(a, b) {
-  return (
-    a.x < b.x + b.size &&
-    a.x + a.w > b.x &&
-    a.y < b.y + b.size &&
-    a.y + a.h > b.y
-  );
-}
-
-// プレイヤー用の判定
-function rectsIntersectPlayer(bullet, player) {
-  return (
-    bullet.x < player.x + player.w &&
-    bullet.x + bullet.w > player.x &&
-    bullet.y < player.y + player.h &&
-    bullet.y + bullet.h > player.y
-  );
-}
-
-// 星の背景スクロール
-const STAR_NUM = 60;
-let stars = [];
-function initStars() {
-  stars = [];
-  for (let i = 0; i < STAR_NUM; i++) {
-    stars.push({
-      x: Math.random() * CANVAS_WIDTH,
-      y: Math.random() * CANVAS_HEIGHT,
-      r: Math.random() * 1.5 + 0.5,
-      speed: Math.random() * 1.5 + 0.5
-    });
-  }
-}
-function updateAndDrawStars() {
-  ctx.save();
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-  ctx.fillStyle = '#fff';
-  stars.forEach(star => {
-    star.y += star.speed;
-    if (star.y > CANVAS_HEIGHT) {
-      star.x = Math.random() * CANVAS_WIDTH;
-      star.y = 0;
-      star.r = Math.random() * 1.5 + 0.5;
-      star.speed = Math.random() * 1.5 + 0.5;
-    }
-    ctx.beginPath();
-    ctx.arc(star.x, star.y, star.r, 0, Math.PI * 2);
-    ctx.fill();
-  });
-  ctx.restore();
-}
-initStars();
-
-// 矩形の衝突判定関数
-function rectsIntersect(a, b) {
-  return (
-    a.x < b.x + b.size &&
-    a.x + a.w > b.x &&
-    a.y < b.y + b.size &&
-    a.y + a.h > b.y
-  );
-}
-// プレイヤー用の判定
-function rectsIntersectPlayer(obj, player) {
-  // obj: bullet or enemy
-  const ow = obj.w !== undefined ? obj.w : obj.size;
-  const oh = obj.h !== undefined ? obj.h : obj.size;
-  return (
-    obj.x < player.x + player.w &&
-    obj.x + ow > player.x &&
-    obj.y < player.y + player.h &&
-    obj.y + oh > player.y
-  );
-}
-
-</script>
 </body>
 </html>
